@@ -17,9 +17,10 @@ E2B 是一个开源的 AI 代码执行平台，底层基于 Firecracker microVM 
 7. [第六步：构建基础模板](#7-构建基础模板)
 8. [第七步：验证与使用](#8-验证与使用)
 9. [深入：一个沙箱是如何被创建的](#9-沙箱创建流程)
-10. [存储架构：如何脱离云存储](#10-存储架构)
-11. [网络架构：每个 VM 的网络是怎么建的](#11-网络架构)
-12. [生产环境扩展](#12-生产环境扩展)
+10. [深入：NBD——E2B 磁盘 I/O 的核心机制](#10-nbd)
+11. [存储架构：如何脱离云存储](#11-存储架构)
+12. [网络架构：每个 VM 的网络是怎么建的](#12-网络架构)
+13. [生产环境扩展](#13-生产环境扩展)
 
 ---
 
@@ -239,25 +240,137 @@ services:
     ports: ["30006:30006"]      # 日志路由
 ```
 
-### 初始化数据库
+### 初始化数据库和环境
 
-```bash
-# PostgreSQL：创建表结构（使用 goose 迁移工��）
-make -C packages/db migrate-local
+基础设施服务启动后，需要初始化数据库 schema 和种子数据。以下逐一拆解每条命令。
 
-# ClickHouse：创建分析表
-make -C packages/clickhouse migrate-local
+#### 3.1 `make -C packages/db migrate-local` — 初始化 PostgreSQL
 
-# 创建默认用户、团队和 API Key
-make -C packages/local-dev seed-database
+```makefile
+# packages/db/Makefile
+goose-local := GOOSE_DBSTRING=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable \
+               go tool goose -table "_migrations" -dir "migrations" postgres
+
+migrate-local:
+	@$(goose-local) up
 ```
 
-seed 命令执行 `packages/local-dev/seed-local-database.go`，会创建：
+使用 [goose](https://github.com/pressly/goose) 迁移工具，连接本地 PostgreSQL，按顺序执行 `packages/db/migrations/` 下的所有 SQL 迁移文件。
 
-- 测试用户 UUID: `fb69f46f-eb51-4a87-a14e-306f7a3fd89c`
-- 测试团队 UUID: `0b8a3ded-4489-4722-afd1-1d82e64ec2d5`
-- API Key: `e2b_53ae1fed82754c17ad8077fbc8bcdd90`
-- Access Token: `sk_e2b_89215020937a4c989cde33d7bc647715`
+迁移文件按时间戳排序，从最早的建表语句到最新的 schema 变更：
+
+```
+packages/db/migrations/
+  ├── 20000101000000_auth.sql                          ← 认证 schema
+  ├── 20231124185944_create_schemas_and_tables.sql      ← 核心表：teams, envs, snapshots...
+  ├── 20250606213446_deployment_cluster.sql             ← clusters 表
+  ├── ...（共 60+ 个迁移文件）
+  └── 20260316130000_repoint_user_fks_to_public_users.sql ← 最新迁移
+```
+
+迁移记录存储在 `_migrations` 表中，已执行过的不会重复执行。如果你中途新增了迁移文件，再次运行 `migrate-local` 只会执行新增的部分。
+
+**如果报错**：通常是 PostgreSQL 还没启动完成。等 Docker 容器 healthy 后再执行。
+
+#### 3.2 `make -C packages/clickhouse migrate-local` — 初始化 ClickHouse
+
+```makefile
+# packages/clickhouse/Makefile
+migrate-local:
+	GOOSE_DBSTRING="clickhouse://clickhouse:clickhouse@localhost:9000/default" \
+	go tool goose -table "_migrations" -dir "migrations" clickhouse up
+```
+
+同样使用 goose，但驱动切换为 `clickhouse`。ClickHouse 用于存储沙箱运行指标和分析数据：
+
+```
+packages/clickhouse/migrations/
+  ├── 20250521131545_add_metrics_local.sql       ← 本地环境指标表
+  ├── 20250725223340_add_sandbox_events_local.sql ← 沙箱事件表
+  ├── 20250801113224_team_metrics.sql             ← 团队级别指标
+  ├── 20260209152327_add_sandbox_host_stats.sql   ← 宿主机资源统计
+  └── ...（共 20 个迁移文件）
+```
+
+ClickHouse 的迁移文件中带 `_local` 后缀的是专门为本地单节点环境设计的（使用 `MergeTree` 引擎而非分布式引擎）。
+
+#### 3.3 `make -C packages/envd build` — 构建 Envd
+
+```makefile
+# packages/envd/Makefile
+build:
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(BUILD_ARCH) go build -a -o bin/envd ${LDFLAGS}
+```
+
+编译 Envd——运行在每个 Firecracker VM 内部的守护进程。关键编译参数：
+
+- `CGO_ENABLED=0`：纯静态链接，不依赖 glibc。因为 Firecracker VM 内是最小化 Linux 环境，可能没有标准 C 库
+- `GOOS=linux GOARCH=$(BUILD_ARCH)`：交叉编译为 Linux（Firecracker 只支持 Linux 客户机）
+- `-a`：强制重新编译所有包（确保静态链接完整）
+
+编译产物 `bin/envd` 需要复制到 Orchestrator 可以访问的路径：
+
+```bash
+# Orchestrator 期望 envd 在这个路径（默认值）
+HOST_ENVD_PATH=/fc-envd/envd
+```
+
+Envd 启动后在 VM 内监听 49983 端口，通过 Connect-RPC（HTTP + Protobuf）提供进程管理和文件系统 API。它是沙箱能力的核心——用户通过 SDK 执行代码、读写文件，最终都是 Envd 在 VM 内完成的。
+
+#### 3.4 `make -C packages/local-dev seed-database` — 创建种子数据
+
+```makefile
+# packages/local-dev/Makefile
+seed-database:
+	go run seed-local-database.go
+```
+
+执行 `packages/local-dev/seed-local-database.go`，向 PostgreSQL 写入本地开发所需的用户、团队和认证令牌。
+
+**创建的实体**：
+
+```go
+// packages/local-dev/seed-local-database.go
+var (
+    teamID         = uuid.MustParse("0b8a3ded-4489-4722-afd1-1d82e64ec2d5")
+    userID         = uuid.MustParse("fb69f46f-eb51-4a87-a14e-306f7a3fd89c")
+    userTokenValue = "89215020937a4c989cde33d7bc647715"
+    teamTokenValue = "53ae1fed82754c17ad8077fbc8bcdd90"
+)
+```
+
+具体流程：
+
+```
+1. upsertUser()       → 创建用户 user@e2b-dev.local
+2. upsertTeam()       → 创建团队 "local-dev team"（slug: local-dev-team, tier: base_v1）
+3. ensureUserIsOnTeam()→ 将用户加入团队，并设为默认团队
+4. upsertUserToken()  → 创建 Access Token（SHA256 哈希后存储）
+5. upsertTeamAPIKey() → 创建 Team API Key（SHA256 哈希后存储）
+```
+
+**安全细节**：令牌不是明文存储的。seed 程序会对令牌做 SHA256 哈希后才写入数据库，和生产环境使用相同的 `keys.NewSHA256Hashing()` 逻辑：
+
+```go
+func createTokenHash(prefix, accessToken string) (string, keys.MaskedIdentifier, error) {
+    hasher := keys.NewSHA256Hashing()
+    accessTokenBytes, _ := hex.DecodeString(tokenWithoutPrefix)
+    accessTokenHash := hasher.Hash(accessTokenBytes)  // ← 数据库只存哈希
+    accessTokenMask, _ := keys.MaskKey(prefix, tokenWithoutPrefix)
+    return accessTokenHash, accessTokenMask, nil
+}
+```
+
+所有 upsert 操作都使用 `ON CONFLICT DO NOTHING` 或 `ON CONFLICT DO UPDATE`，因此可以安全地多次执行。
+
+**生成的凭证**（用于 SDK 连接）：
+
+| 凭证 | 值 | 用途 |
+|------|------|------|
+| API Key | `e2b_53ae1fed82754c17ad8077fbc8bcdd90` | 团队级别的 API 认证 |
+| Access Token | `sk_e2b_89215020937a4c989cde33d7bc647715` | 用户级别的访问令牌 |
+
+> `e2b_` 和 `sk_e2b_` 前缀由 `keys.ApiKeyPrefix` 和 `keys.AccessTokenPrefix` 定义，SDK 会自动识别。
 
 ---
 
@@ -270,53 +383,273 @@ make download-public-kernels        # Guest 内核: vmlinux-6.1.158
 make download-public-firecrackers   # Firecracker: v1.12.1
 ```
 
-下载完成后，二进制文件存放在：
+### 这两条命令做了什么？
+
+**`make download-public-kernels`**：
+
+```makefile
+# Makefile:122
+download-public-kernels:
+	mkdir -p ./packages/fc-kernels
+	gsutil cp -r gs://e2b-prod-public-builds/kernels/* ./packages/fc-kernels/
+```
+
+从 E2B 的公开 GCS 存储桶（`e2b-prod-public-builds`）下载预编译的 Linux 客户机内核。这些内核是 E2B 团队基于 Linux 6.1.158 源码定制编译的，包含 Firecracker 运行所需的最小化内核配置（virtio 驱动、ext4 文件系统等），去掉了不需要的模块以减小体积和启动时间。
+
+下载后目录结构：
 
 ```
-/fc-kernels/vmlinux-6.1.158/vmlinux.bin   ← Guest 内核
-/fc-versions/v1.12.1/firecracker          ← Firecracker VMM
+packages/fc-kernels/
+  └── vmlinux-6.1.158/
+        └── vmlinux.bin     # 未压缩的 ELF 内核镜像（Firecracker 要求 uncompressed）
 ```
 
-Orchestrator 启动时通过配置定位这些文件：
+> **注意**：Firecracker 不支持 bzImage/zImage 等压缩格式，必须使用未压缩的 `vmlinux` 格式。这也是为什么要用定制编译而不是直接用发行版内核。
+
+**`make download-public-firecrackers`**：
+
+```makefile
+# Makefile:127
+download-public-firecrackers:
+	mkdir -p ./packages/fc-versions/builds/
+	gsutil -m cp -r gs://e2b-prod-public-builds/firecrackers/* ./packages/fc-versions/builds/
+	find ./packages/fc-versions/builds/ -name firecracker -exec chmod +x {} \;
+```
+
+下载 E2B 定制的 Firecracker 二进制文件（基于 v1.12.1），下载后自动 `chmod +x` 添加可执行权限。
+
+这条命令做了三件事：
+1. `mkdir -p` 创建目标目录
+2. `gsutil -m cp -r` 并行（`-m`）递归下载所有 Firecracker 版本
+3. `find ... -exec chmod +x` 遍历所有下载的 `firecracker` 文件，添加可执行权限
+
+下载后目录结构：
+
+```
+packages/fc-versions/builds/
+  └── v1.12.1_<commit>/
+        └── firecracker     # Firecracker VMM 二进制（~5MB）
+```
+
+**什么是 Firecracker？** Firecracker 是一个用 Rust 编写的轻量级 VMM（Virtual Machine Monitor），通过 KVM 提供硬件级虚拟化隔离。它只有约 5MB，不包含 BIOS/UEFI、USB、显卡等传统 VM 组件——**只保留启动 Linux 内核所需的最小功能集**。E2B 在官方版本基础上做了定制，主要涉及快照恢复（UFFD）和内存管理方面的优化。
+
+Firecracker 启动后通过 Unix socket 暴露 HTTP API，Orchestrator 通过这个 API 配置和控制 VM：
+
+```
+PUT /boot-source          ← 指定内核
+PUT /drives/rootfs        ← 指定磁盘
+PUT /network-interfaces   ← 指定网络
+PUT /machine-config       ← 指定 CPU/内存
+PUT /actions              ← 启动/暂停 VM
+```
+
+### 没有 `gsutil` 怎么办？
+
+`gsutil` 是 Google Cloud SDK 的一部分。如果你的机房无法安装或不想安装 GCP 工具链，这个公开 GCS 桶也支持 HTTP 直接访问：
+
+```bash
+# 手动下载内核（替代 gsutil）
+mkdir -p ./packages/fc-kernels/vmlinux-6.1.158
+curl -o ./packages/fc-kernels/vmlinux-6.1.158/vmlinux.bin \
+  "https://storage.googleapis.com/e2b-prod-public-builds/kernels/vmlinux-6.1.158/vmlinux.bin"
+
+# 手动下载 Firecracker（查看可用版本后替换 VERSION）
+mkdir -p ./packages/fc-versions/builds/<VERSION>
+curl -o ./packages/fc-versions/builds/<VERSION>/firecracker \
+  "https://storage.googleapis.com/e2b-prod-public-builds/firecrackers/<VERSION>/firecracker"
+chmod +x ./packages/fc-versions/builds/<VERSION>/firecracker
+```
+
+或者你也可以自行从源码编译：
+- **内核**：从 [kernel.org](https://kernel.org) 下载 6.1.x 源码，使用 Firecracker 推荐的 `.config` 编译
+- **Firecracker**：从 [E2B 的 fc-versions 仓库](https://github.com/e2b-dev/fc-versions) 构建
+
+### 下载了多个版本，E2B 怎么选？
+
+GCS 桶里有多个 Firecracker 和内核版本，`gsutil cp -r` 会全部下载。那 E2B 怎么决定用哪个？
+
+#### 版本选择的完整链路
+
+```
+用户创建模板（SDK/CLI）
+  ↓
+API 层：从 feature flag 获取默认版本
+  ↓ 写入数据库（模板构建记录）
+模板构建：用指定版本的 FC + 内核创建快照
+  ↓ 版本信息持久化到模板 metadata.json
+用户创建沙箱
+  ↓ 从模板的 Build 记录读取版本
+API → Orchestrator gRPC 请求（携带版本号）
+  ↓
+Orchestrator：ResolveFirecrackerVersion() 解析短版本号
+  ↓ 拼接文件路径 → os.Stat() 验证存在 → 启动 VM
+```
+
+#### 1. 默认版本定义
+
+版本的"真相源"在 `packages/shared/pkg/featureflags/flags.go`：
+
+```go
+// 内核：只有一个默认版本
+const DefaultKernelVersion = "vmlinux-6.1.158"
+
+// Firecracker：支持多版本并存
+const (
+    DefaultFirecackerV1_10Version = "v1.10.1_30cbb07"
+    DefaultFirecackerV1_12Version = "v1.12.1_210cbac"
+    DefaultFirecrackerVersion     = DefaultFirecackerV1_12Version  // 当前默认
+)
+```
+
+版本号格式是 `v{major}.{minor}.{patch}_{git_short_sha}`，包含 git commit 以区分同版本的不同构建。
+
+#### 2. 版本别名映射
+
+E2B 维护一个短版本号 → 完整版本号的映射表：
+
+```go
+var FirecrackerVersionMap = map[string]string{
+    "v1.10": "v1.10.1_30cbb07",
+    "v1.12": "v1.12.1_210cbac",
+}
+```
+
+这个映射可以通过 LaunchDarkly feature flag（`firecracker-versions`）动态更新。本地部署没有 LaunchDarkly 时，使用上面的硬编码默认值。
+
+#### 3. 模板构建时的版本选择
+
+当用户构建模板时，API 从 feature flag 获取版本：
+
+```go
+// packages/api/internal/handlers/template_request_build_v3.go
+firecrackerVersion := featureFlags.StringFlag(ctx, featureflags.BuildFirecrackerVersion)
+// BuildFirecrackerVersion 的默认值 = DefaultFirecrackerVersion = "v1.12.1_210cbac"
+```
+
+版本号随后写入数据库的 Build 记录，与模板绑定。
+
+#### 4. 沙箱创建时的版本解析
+
+当用户从模板创建沙箱时，版本号从 Build 记录中读取，通过 gRPC 传给 Orchestrator：
+
+```go
+// packages/api/internal/orchestrator/create_instance.go
+// 从数据库的 Build 记录读取版本
+KernelVersion:      sbxData.Build.KernelVersion,       // "vmlinux-6.1.158"
+FirecrackerVersion: sbxData.Build.FirecrackerVersion,   // "v1.12.1_210cbac"
+```
+
+Orchestrator 收到后，通过 `ResolveFirecrackerVersion()` 做一次版本解析：
+
+```go
+// packages/orchestrator/pkg/server/sandboxes.go:158
+resolvedFCVersion := featureflags.ResolveFirecrackerVersion(
+    ctx, s.featureFlags, req.GetSandbox().GetFirecrackerVersion(),
+)
+
+config := sandbox.Config{
+    FirecrackerConfig: fc.Config{
+        KernelVersion:      req.GetSandbox().GetKernelVersion(),
+        FirecrackerVersion: resolvedFCVersion,  // 解析后的完整版本
+    },
+}
+```
+
+解析逻辑：从 `v1.12.1_210cbac` 提取 `v1.12`，在映射表中查找，如果映射表有新版本就用新版本，否则用原值：
+
+```go
+// packages/shared/pkg/featureflags/flags.go:263
+func ResolveFirecrackerVersion(ctx context.Context, ff *Client, buildVersion string) string {
+    // "v1.12.1_210cbac" → 提取 "v1.12"
+    parts := strings.Split(buildVersion, "_")
+    versionParts := strings.Split(strings.TrimPrefix(parts[0], "v"), ".")
+    key := fmt.Sprintf("v%s.%s", versionParts[0], versionParts[1])  // "v1.12"
+
+    // 在映射表中查找
+    versions := ff.JSONFlag(ctx, FirecrackerVersions).AsValueMap()
+    if resolved, ok := versions.Get(key).AsOptionalString().Get(); ok {
+        return resolved  // 映射表中的版本（可能是更新的 patch 版本）
+    }
+
+    return buildVersion  // 映射表中没有，用原值
+}
+```
+
+**这个机制的巧妙之处**：可以通过更新 feature flag 映射表，让所有 `v1.12` 系列的模板自动使用新的 Firecracker 补丁版本，而不需要重新构建模板。
+
+#### 5. 最终路径拼接
+
+版本号确定后，Orchestrator 拼接文件路径：
 
 ```go
 // packages/orchestrator/pkg/sandbox/fc/config.go
 func (c Config) HostKernelPath(builderConfig cfg.BuilderConfig) string {
     return filepath.Join(
         builderConfig.HostKernelsDir,    // 默认 /fc-kernels
-        c.KernelVersion,                  // 如 vmlinux-6.1.158
+        c.KernelVersion,                  // "vmlinux-6.1.158"
         "vmlinux.bin",
     )
+    // → /fc-kernels/vmlinux-6.1.158/vmlinux.bin
 }
 
 func (c Config) FirecrackerPath(builderConfig cfg.BuilderConfig) string {
     return filepath.Join(
         builderConfig.FirecrackerVersionsDir,  // 默认 /fc-versions
-        c.FirecrackerVersion,                   // 如 v1.12.1
+        c.FirecrackerVersion,                   // "v1.12.1_210cbac"
         "firecracker",
     )
+    // → /fc-versions/v1.12.1_210cbac/firecracker
 }
 ```
 
-在 `NewProcess()` 中会验证文件是否存在：
+在启动 Firecracker 进程前，会用 `os.Stat()` 验证文件确实存在：
 
 ```go
 // packages/orchestrator/pkg/sandbox/fc/process.go
 func NewProcess(...) (*Process, error) {
-    // 验证 Firecracker 二进制存在
     _, err = os.Stat(versions.FirecrackerPath(config))
     if err != nil {
         return nil, fmt.Errorf("firecracker binary not found: %w", err)
     }
 
-    // 验证内核文件存在
     _, err = os.Stat(versions.HostKernelPath(config))
     if err != nil {
         return nil, fmt.Errorf("kernel not found: %w", err)
     }
-    // ...
 }
 ```
+
+#### 总结
+
+```
+                     下载的文件（多版本并存）
+                     ┌─────────────────────────────────────┐
+                     │ /fc-kernels/                         │
+                     │   └── vmlinux-6.1.158/vmlinux.bin    │
+                     │ /fc-versions/                        │
+                     │   ├── v1.10.1_30cbb07/firecracker   │
+                     │   └── v1.12.1_210cbac/firecracker   │ ← 当前默认
+                     └─────────────────────────────────────┘
+                                    ↑
+                                    │ os.Stat() 验证 + filepath.Join() 拼接
+                                    │
+              版本选择链路
+              ┌──────────────────────────────────┐
+              │ 1. 硬编码默认值                    │ DefaultFirecrackerVersion
+              │    ↓ 可被覆盖                      │
+              │ 2. 环境变量                        │ DEFAULT_FIRECRACKER_VERSION
+              │    ↓ 可被覆盖                      │
+              │ 3. LaunchDarkly feature flag      │ build-firecracker-version
+              │    ↓ 写入数据库                     │
+              │ 4. 模板 Build 记录                 │ 跟模板绑定
+              │    ↓ gRPC 传递                     │
+              │ 5. ResolveFirecrackerVersion()    │ 短版本别名解析
+              │    ↓                              │
+              │ 6. filepath.Join() → os.Stat()    │ 拼接路径 + 验证
+              └──────────────────────────────────┘
+```
+
+**本地部署的简单情况**：没有 LaunchDarkly，没有自定义环境变量，所以直接使用硬编码默认值 `vmlinux-6.1.158` + `v1.12.1_210cbac`。你只需要确保这两个版本的文件在 `/fc-kernels/` 和 `/fc-versions/` 下存在即可。
 
 ---
 
@@ -608,7 +941,220 @@ catalog.StoreSandbox(ctx, sandboxID, info, expiration)
 
 ---
 
-## 10. 存储架构：如何脱离云存储
+## 10. 深入：NBD——E2B 磁盘 I/O 的核心机制
+
+### 10.1 什么是 NBD？
+
+NBD（Network Block Device）是 Linux 内核提供的一种机制：**将一个远程（或本地用户态程序）提供的存储，映射为一个标准的块设备（`/dev/nbdX`）**。
+
+传统块设备（如 `/dev/sda`）背后是物理硬盘或 SSD。NBD 的核心思想是：
+
+```
+普通块设备:   应用程序 → 内核文件系统 → 块设备驱动 → 物理磁盘
+NBD 块设备:   应用程序 → 内核文件系统 → NBD 内核客户端 → Socket → 用户态 NBD 服务端
+```
+
+当内核需要读写 `/dev/nbd0` 上的某个块时，它不会去访问物理磁盘，而是通过 socket 把请求发给一个用户态程序。这个用户态程序可以从**任何地方**（内存、文件、网络、另一个设备）读取数据并返回。
+
+### 10.2 为什么 E2B 使用 NBD？
+
+Firecracker VM 需要一个 rootfs 块设备。E2B 面临的挑战是：
+
+1. **模板共享**：同一个模板可能被数百个沙箱同时使用，不能每个沙箱都复制一份完整的磁盘镜像
+2. **写入隔离**：每个沙箱的文件修改不能影响其他沙箱
+3. **按需加载**：模板可能有几 GB，不应该在沙箱启动时全部加载到内存
+
+NBD 完美解决了这些问题——E2B 在用户态实现了一个 **Copy-on-Write overlay**：
+
+```
+VM 读取 /dev/nbd0 上的块
+  ↓ 内核发送 NBD 读请求
+  ↓ Socket
+Dispatch（E2B 的用户态 NBD 服务端）
+  ↓ 调用 Overlay.ReadAt()
+  ├── 先查 Cache（mmap 稀疏文件，存放写入的脏块）
+  │   ├── 命中 → 返回缓存数据
+  │   └── 未命中 → 继续
+  └── 回退到 Template（只读的模板镜像）
+      └── 从 GCS/本地文件系统按需加载对应的块
+
+VM 写入 /dev/nbd0 上的块
+  ↓ 内核发送 NBD 写请求
+  ↓ Socket
+Dispatch
+  ↓ 调用 Overlay.WriteAt()
+  └── 直接写入 Cache（不修改模板）
+```
+
+### 10.3 E2B 的 NBD 实现细节
+
+#### Socket Pair 连接
+
+E2B 不使用 TCP 网络，而是使用 **Unix Socket Pair** 在同一台机器上建立 NBD 连接：
+
+```go
+// packages/orchestrator/pkg/sandbox/nbd/path_direct.go
+func (d *DirectPathMount) Open(ctx context.Context) (uint32, error) {
+    // 1. 创建 Unix socket pair（进程内通信，零网络开销）
+    sockPair, _ := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+
+    client := os.NewFile(uintptr(sockPair[0]), "client")   // 给内核 NBD 客户端
+    server := os.NewFile(uintptr(sockPair[1]), "server")   // 给用户态 Dispatch
+
+    // 2. 启动用户态 NBD 服务端（处理读写请求）
+    dispatch := NewDispatch(serverConn, d.Backend)  // Backend = Overlay
+    go dispatch.Handle(ctx)
+
+    // 3. 通过 Netlink 将 socket 的客户端连接到 /dev/nbdX
+    nbdnl.Connect(deviceIndex, []*os.File{client}, size, 0, serverFlags, opts...)
+
+    // 4. 等待连接就绪
+    for {
+        s, _ := nbdnl.Status(deviceIndex)
+        if s.Connected { break }
+    }
+    return deviceIndex, nil
+}
+```
+
+关键点：`nbdnl.Connect()` 是通过 **Linux Netlink**（内核通信接口）告诉 NBD 内核模块："请使用这个 socket 来处理 `/dev/nbdX` 的所有 I/O 请求"。
+
+#### NBD 协议解析
+
+`Dispatch.Handle()` 实现了 NBD 线级协议（wire protocol）：
+
+```go
+// packages/orchestrator/pkg/sandbox/nbd/dispatch.go
+type Request struct {
+    Magic  uint32   // 0x25609513（NBD 魔数）
+    Type   uint32   // 0=Read, 1=Write, 2=Disconnect
+    Handle uint64   // 请求标识符（用于异步响应匹配）
+    From   uint64   // 偏移量（从磁盘的第几个字节开始）
+    Length uint32   // 要读/写的字节数
+}
+
+func (d *Dispatch) Handle(ctx context.Context) error {
+    buffer := make([]byte, 4*1024*1024)  // 4MB 缓冲区
+    for {
+        n, _ := d.fp.Read(buffer[wp:])   // 从 socket 读取请求
+
+        // 解析 28 字节的请求头
+        request.Magic  = binary.BigEndian.Uint32(header)
+        request.Type   = binary.BigEndian.Uint32(header[4:8])
+        request.Handle = binary.BigEndian.Uint64(header[8:16])
+        request.From   = binary.BigEndian.Uint64(header[16:24])
+        request.Length  = binary.BigEndian.Uint32(header[24:28])
+
+        switch request.Type {
+        case NBDCmdRead:       // → Overlay.ReadAt(offset, length)
+            d.cmdRead(ctx, request.Handle, request.From, request.Length)
+        case NBDCmdWrite:      // → Overlay.WriteAt(data, offset)
+            d.cmdWrite(ctx, request.Handle, request.From, data)
+        case NBDCmdDisconnect: // VM 关闭或断开
+            return nil
+        }
+    }
+}
+```
+
+每个读请求在**单独的 goroutine** 中处理，允许并行 I/O。写请求同样异步执行。响应通过 `writeResponse()` 发回 socket：
+
+```go
+type Response struct {
+    Magic  uint32   // 0x67446698（NBD 响应魔数）
+    Error  uint32   // 0=成功, 1=错误
+    Handle uint64   // 匹配对应的请求
+}
+// 读响应：Response + 数据
+// 写响应：仅 Response（无数据）
+```
+
+#### Overlay 层：Copy-on-Write 的核心
+
+```go
+// packages/orchestrator/pkg/sandbox/block/overlay.go
+type Overlay struct {
+    device    ReadonlyDevice   // 只读模板（从 GCS/本地文件按需加载）
+    cache     *Cache           // 可写缓存（mmap 稀疏文件）
+    blockSize int64            // 块大小（通常 4KB）
+}
+
+func (o *Overlay) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+    // 逐块读取
+    for _, blockOff := range header.BlocksOffsets(len(p), o.blockSize) {
+        // 先尝试 Cache（O(1) 查找 dirty map）
+        n, err := o.cache.ReadAt(p[blockOff:blockOff+o.blockSize], off+blockOff)
+        if err == nil {
+            continue  // Cache 命中，这个块用缓存的数据
+        }
+        // Cache 未命中（BytesNotAvailableError）→ 从模板读
+        o.device.ReadAt(ctx, p[blockOff:blockOff+o.blockSize], off+blockOff)
+    }
+    return len(p), nil
+}
+
+func (o *Overlay) WriteAt(p []byte, off int64) (int, error) {
+    return o.cache.WriteAt(p, off)  // 所有写入只进 Cache，不修改模板
+}
+```
+
+Cache 层使用 **mmap 稀疏文件** + `sync.Map` 跟踪脏块：
+- 写入时：`copy(mmap[off:], data)` + `dirty.Store(offset, struct{}{})`
+- 读取时：检查 `dirty.Load(offset)`，存在则返回 mmap 数据，否则返回 `BytesNotAvailableError`
+
+#### NBD 设备生命周期
+
+```
+创建沙箱:
+  DevicePool.GetDevice()          ← 从池中获取空闲 /dev/nbdX
+  DirectPathMount.Open()          ← socketpair + Dispatch + nbdnl.Connect
+  NBDProvider.Start()             ← 返回设备路径给 Firecracker
+
+沙箱运行中:
+  Firecracker VM 读写 /dev/nbdX   ← 内核 → socket → Dispatch → Overlay
+
+关闭沙箱:
+  NBDProvider.sync()              ← ioctl(BLKFLSBUF) 刷新内核缓冲
+  DirectPathMount.Close()         ← 取消 context → 关闭 socket → Drain 等待
+                                     nbdnl.Disconnect(deviceIndex)
+                                     等待 /sys/block/nbdX/pid 消失
+  DevicePool.ReleaseDevice()      ← 归还到设备池
+```
+
+### 10.4 为什么不用其他方案？
+
+| 方案 | 缺点 |
+|------|------|
+| 直接文件 | 每个沙箱复制完整镜像（慢、占空间） |
+| Loop 设备 | 不支持 CoW，需要预复制 |
+| Device Mapper thin-provisioning | 需要 LVM 设置，运维复杂 |
+| Overlay FS | 是文件系统级别的，不是块设备级别的，Firecracker 需要块设备 |
+| FUSE | 内核态→用户态切换开销大 |
+| **NBD + 用户态 Overlay** | **✓** 块设备接口、CoW、按需加载、无需预复制 |
+
+E2B 选择 NBD 是因为它提供了**块设备接口**（Firecracker 需要）+ **用户态灵活性**（可以实现任意的读写逻辑），同时避免了每个沙箱复制完整磁盘镜像的开销。
+
+### 10.5 系统配置要点
+
+```bash
+# 加载 NBD 模块（指定最大设备数）
+sudo modprobe nbd nbds_max=4096   # 生产环境
+sudo modprobe nbd nbds_max=64     # 本地开发
+
+# 减少 inotify 噪音（4096 个设备会产生大量事件）
+echo 'ACTION=="add|change", KERNEL=="nbd*", OPTIONS:="nowatch"' | \
+  sudo tee /etc/udev/rules.d/97-nbd-device.rules
+
+# 验证
+cat /sys/module/nbd/parameters/nbds_max  # 应输出你设置的值
+ls /dev/nbd0                              # 设备节点应存在
+```
+
+`nbds_max` 决定了系统中最多有多少个 `/dev/nbdX` 设备可用。每个运行中的沙箱占用一个 NBD 设备，所以这个值限制了**单台服务器上的最大并发沙箱数**。
+
+---
+
+## 11. 存储架构：如何脱离云存储
 
 E2B 的存储抽象层位于 `packages/shared/pkg/storage/`，支持三种后端：
 
@@ -677,7 +1223,7 @@ func (s *fsStorage) UploadSignedURL(ctx context.Context, path string, ttl time.D
 
 ---
 
-## 11. 网络架构：每个 VM 的网络是怎么建的
+## 12. 网络架构：每个 VM 的网络是怎么建的
 
 每个沙箱拥有独立的 Linux 网络命名空间。E2B 预创建了两个网络池（`packages/orchestrator/pkg/sandbox/network/pool.go`）：
 
@@ -747,7 +1293,7 @@ const (
 
 ---
 
-## 12. 生产环境扩展
+## 13. 生产环境扩展
 
 单机跑通后，扩展到多节点生产集群的关键步骤：
 
