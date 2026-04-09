@@ -823,82 +823,420 @@ print(result.stdout)  # Hello from Firecracker!
 
 ## 9. 深入：一个沙箱是如何被创建的
 
-当用户调用 `Sandbox()` 时，背后发生了什么？
+当用户调用 `Sandbox()` 时，一个 HTTP 请求从 SDK 出发，经过认证、调度、资源分配，最终在一台物理机上启动一个 Firecracker microVM。整个过程涉及 API、Orchestrator 两个服务，横跨 6 个阶段。
 
-### 9.1 API 接收请求
+### 全景时序图
 
-API 收到 `POST /sandboxes` 请求后，使用 **Best-of-K 调度算法** 选择目标 Orchestrator 节点：
+```
+用户 SDK                    API (:3000)                  Orchestrator (:5008)           Firecracker VM
+  │                           │                              │                             │
+  │  POST /sandboxes          │                              │                             │
+  │ ────────────────────��────>│                              │                             │
+  │                           │  ① 认证 + 限流               │                             │
+  │                           │  ② 解析模板 + 获取构建信息     │                             │
+  │                           │  ③ 并发配额检查 (Redis)       │                             │
+  │                           │  ④ Best-of-K 节点调度         │                             │
+  │                           │                              │                             │
+  │                           │  gRPC SandboxCreate           │                             │
+  │                           │ ────────────────────────────>│                             │
+  │                           │                              │  ⑤ 节点容量 + 启动信号量      │
+  │                           │                              │  ⑥ 获取模板缓存              │
+  │                           │                              │                             │
+  │                           │                              │  ⑦ 并行资源初始化:            │
+  │                           │                              │    ├─ 网络 Slot              │
+  │                           │                              │    ├─ NBD Rootfs Overlay     │
+  │                           │                              │    └─ UFFD 内存服务           │
+  │                           │                              │                             │
+  │                           │                              │  ⑧ 创建 Cgroup              │
+  │                           │                              │  ⑨ 启动 FC 进程              │
+  │                           │                              │ ──────────────────────────> │
+  │                           │                              │  ⑩ 加载快照 + 恢复 VM        │
+  │                           │                              │                             │
+  │                           │                              │  ⑪ 等待 Envd POST /init      │
+  │                           │                              │ <─ ─ ─ ─ ─ ─ ─ ─ ─ 204 ─ ─ │
+  │                           │                              │                             │
+  │                           │                              │  ⑫ 标记 Running + 健康检查    │
+  │                           │         gRPC Response         │                             │
+  │                           │ <────────────────────────────│                             │
+  │                           │                              │                             │
+  │                           │  ⑬ 写入 Redis 路由表          │                             │
+  │                           │  ⑭ 发送分析事件               │                             │
+  │   201 Created             │                              │                             │
+  │ <─────────────────────────│                              │                             │
+```
+
+### 9.1 SDK → API：请求入口
+
+用户的 `Sandbox()` 调用最终变成一个 `POST /sandboxes` HTTP 请求，发送到 API 服务。
+
+#### 认证
+
+请求首先经过 Gin 中间件链处理。认证中间件校验请求头中的 API Key（`e2b_` 前缀）或 Access Token（`sk_e2b_` 前缀），提取对应的团队信息：
+
+```go
+// 在 handler 中通过 context 获取已认证的团队信息
+teamInfo := auth.MustGetTeamInfo(c)
+```
+
+认证通过后，团队的配额限制（最大并发数、最大运行时长、功能权限等）一并带入后续流程。
+
+#### 限流
+
+认证之后是 Redis 令牌桶限流，按 `ratelimit:{teamID}:{route}` 键控制每个团队的请求速率。限流阈值通过 LaunchDarkly feature flag 动态配置。Redis 不可用时 fail-open（放行）。
+
+#### 模板解析
+
+API 从请求体中提取 `TemplateID`，经过两步解析：
+
+```go
+// packages/api/internal/handlers/sandbox_create.go
+
+// 1. 解析模板别名（支持 namespace/alias:tag 格式）
+aliasInfo, err := a.templateCache.ResolveAlias(ctx, identifier, teamInfo.Team.Slug)
+
+// 2. 获取模板元数据和构建信息
+env, build, err := a.templateCache.Get(ctx, aliasInfo.TemplateID, tag, teamInfo.Team.ID, clusterID)
+// build 包含：Firecracker 版本、内核版本、Envd 版本、vCPU、内存、磁盘大小等
+```
+
+模板可以有多个别名（alias），也可以通过 tag 指定特定版本的构建。`templateCache` 是一个带 TTL 的缓存层，避免每次都查数据库。
+
+#### 沙箱 ID 生成
+
+```go
+sandboxID := InstanceIDPrefix + id.Generate()  // "i" + 随机字符串，如 "i4z8x9k2m"
+```
+
+前缀 `i` 用于区分沙箱 ID 和其他实体 ID。
+
+#### 参数组装和校验
+
+API 从请求体中提取并校验一系列参数：
+
+```go
+// packages/api/internal/handlers/sandbox_create.go
+
+// 超时：不能超过团队的最大允许时长
+timeout := sandbox.SandboxTimeoutDefault   // 默认超时
+if body.Timeout != nil {
+    timeout = time.Duration(*body.Timeout) * time.Second
+    if timeout > time.Duration(teamInfo.Limits.MaxLengthHours)*time.Hour {
+        // 返回 400 错误
+    }
+}
+
+// 安全模式：生成 envd 访问令牌
+if body.Secure != nil && *body.Secure == true {
+    accessToken, tokenErr := a.getEnvdAccessToken(build.EnvdVersion, sandboxID)
+    // ...
+}
+
+// 网络规则校验：域名白名单要求先 deny ALL_TRAFFIC
+if len(allowedDomains) > 0 && !hasBlockAll {
+    // 返回 400："When specifying allowed domains, you must include 'ALL_TRAFFIC' in deny out"
+}
+```
+
+参数组装完成后，调用 `startSandbox()` 进入核心创建流程。
+
+### 9.2 API 内部：并发控制与节点调度
+
+`startSandbox()` 内部调用 `orchestrator.CreateSandbox()`，这是 API 侧最核心的函数。
+
+#### 并发配额检查
+
+创建沙箱前，必须先抢占团队的并发 slot：
+
+```go
+// packages/api/internal/orchestrator/create_instance.go
+finishStart, waitForStart, err := o.sandboxStore.Reserve(ctx, team.Team.ID, sandboxID, int(totalConcurrentInstances))
+```
+
+这个 `Reserve()` 做三件事：
+1. **检查配额**：当前团队运行中的沙箱是否已达上限。超限返回 `429 Too Many Requests`
+2. **去重**：如果相同 `sandboxID` 正在创建中（重复请求），返回一个 `waitForStart` channel，等待第一个请求完成
+3. **预留 slot**：原子地增加计数器，返回 `finishStart` 回调在创建完成或失败时释放
+
+#### gRPC 请求组装
+
+配额通过后，API 组装 gRPC 请求发给 Orchestrator：
+
+```go
+// packages/api/internal/orchestrator/create_instance.go
+sbxRequest := &orchestrator.SandboxCreateRequest{
+    Sandbox: &orchestrator.SandboxConfig{
+        TemplateId:          sbxData.TemplateID,
+        SandboxId:           sandboxID,
+        ExecutionId:         executionID,        // 每次 start/resume 唯一
+        KernelVersion:       sbxData.Build.KernelVersion,
+        FirecrackerVersion:  sbxData.Build.FirecrackerVersion,
+        EnvVars:             sbxData.EnvVars,
+        Vcpu:                sbxData.Build.Vcpu,
+        RamMb:               sbxData.Build.RamMb,
+        HugePages:           hasHugePages,
+        Snapshot:            isResume,           // 是否从快照恢复
+        Network:             sbxNetwork,         // 出入站规则
+        VolumeMounts:        sbxData.VolumeMounts,
+        // ...
+    },
+    StartTime: timestamppb.New(startTime),
+    EndTime:   timestamppb.New(endTime),
+}
+```
+
+#### Best-of-K 节点调度
+
+API 需要决定把沙箱放在哪个 Orchestrator 节点上：
+
+```go
+// packages/api/internal/orchestrator/create_instance.go
+node, err = placement.PlaceSandbox(ctx, o.placementAlgorithm, clusterNodes, node, sbxRequest, ...)
+```
+
+调度使用 **Best-of-K 算法**（也叫 Power of Two Choices 的推广）：
 
 ```go
 // packages/api/internal/orchestrator/placement/placement_best_of_K.go
-func (b *BestOfK) chooseNode(ctx context.Context, nodes []*nodemanager.Node, ...) (*nodemanager.Node, error) {
-    // 1. 随机采样 K=3 个节点
-    candidates := b.sample(nodes, config, excludedNodes, resources, ...)
 
-    // 2. 对每个候选评分
-    bestScore := math.MaxFloat64
-    for _, node := range candidates {
-        score := b.Score(node, resources, config)
-        if score < bestScore {
-            bestNode = node
-            bestScore = score
-        }
-    }
-    return bestNode, nil
-}
+// 1. 从集群所有节点中随机采样 K 个候选（默认 K=3）
+candidates := b.sample(nodes, config, excludedNodes, resources, ...)
 
-// 评分公式
-func (b *BestOfK) Score(node *nodemanager.Node, resources SandboxResources, config BestOfKConfig) float64 {
+// 2. 对每个候选节点评分（分数越低越好）
+func (b *BestOfK) Score(node, resources, config) float64 {
     metrics := node.Metrics()
-    reserved := metrics.CpuAllocated
-    usageAvg := float64(metrics.CpuPercent) / 100
+    reserved := metrics.CpuAllocated         // 已分配的 CPU
+    usageAvg := float64(metrics.CpuPercent) / 100  // 实际 CPU 使用率
     cpuCount := float64(metrics.CpuCount)
-    totalCapacity := config.R * cpuCount  // R=4.0 超分比
+    totalCapacity := config.R * cpuCount     // R=4.0 超分比
 
+    // 核心公式：(新沙箱 CPU + 已分配 + α×实际使用率) / 总容量
     return (float64(resources.CPUs) + float64(reserved) + config.Alpha*usageAvg) / totalCapacity
 }
+
+// 3. 选得分最低的节点
 ```
+
+**为什么不用轮询或一致性哈希？** Best-of-K 的优势在于：
+- 比随机好——考虑了节点负载
+- 比全局最优快——只采样 K 个，不需要锁或全局排序
+- 自然避免惊群效应——不同请求采样到不同候选集
+
+对于 resume 操作，API 还会尝试**节点亲和**——优先选择之前生成快照的那个节点，因为该节点大概率已经缓存了模板数据。
 
 本地开发只有一个节点，所以调度总是选它。但这套机制在多节点部署时自动生效。
 
-### 9.2 Orchestrator 创建 VM
+### 9.3 Orchestrator：gRPC 入口
 
-Orchestrator 收到 gRPC `SandboxCreate` 请求后，执行 `Factory.CreateSandbox()`：
-
-**Step 1: 分配网络**
+Orchestrator 收到 `SandboxCreate` gRPC 请求，进入 `Server.Create()` 方法：
 
 ```go
-// packages/orchestrator/pkg/sandbox/network/pool.go
-slot, err := pool.Get(ctx)
-// 从预创建的网络池中获取一个 slot
-// 包含：网络命名空间、veth pair、TAP 设备、IP 地址
+// packages/orchestrator/pkg/server/sandboxes.go
+func (s *Server) Create(ctx context.Context, req *orchestrator.SandboxCreateRequest) (*orchestrator.SandboxCreateResponse, error) {
+    // 整个���建操作限时 60 秒
+    ctx, cancel := context.WithTimeoutCause(ctx, requestTimeout, fmt.Errorf("request timed out"))
+    defer cancel()
+    // ...
+}
 ```
 
-**Step 2: 准备存储**
+#### 节点容量检查
 
 ```go
-// 创建 Copy-on-Write overlay：模板（只读）+ Cache（写入层）
-// 通过 NBD 设备挂载到 /dev/nbdX
-rootfsProvider := rootfs.NewNBDProvider(template, nbdDevice, cache)
+runningSandboxes := s.sandboxFactory.Sandboxes.Count()
+if runningSandboxes >= maxRunningSandboxesPerNode {
+    return nil, status.Errorf(codes.ResourceExhausted, "max number of running sandboxes on node reached")
+}
 ```
 
-**Step 3: 生成启动脚本并启动 Firecracker**
+#### 启动信号量
+
+为了防止一台节点同时启动太多沙箱（启动是 I/O 密集的），E2B 用信号量控制并发启动数：
+
+```go
+// packages/orchestrator/pkg/server/sandboxes.go
+
+if req.GetSandbox().GetSnapshot() {
+    // 快照恢复：最多等 15 秒获取信号量
+    err := s.waitForAcquire(ctx)
+} else {
+    // 冷启动：立即尝试，获取不到直接返回 ResourceExhausted
+    acquired := s.startingSandboxes.TryAcquire(1)
+}
+defer s.startingSandboxes.Release(1)
+```
+
+`maxStartingInstancesPerNode` 默认为 3——同一时刻最多 3 个沙箱在启动中。这是一个关键的背压机制。
+
+#### 获取模板缓存
+
+```go
+template, err := s.templateCache.GetTemplate(ctx, req.GetSandbox().GetBuildId(), isSnapshot, false)
+```
+
+模板缓存包含快照的所有文件：内核、rootfs、memfile（内存快照）、snapfile（VM 状态快照）。首次使用的模板会从存储后端（GCS 或本地文件系统）下载到本地磁盘缓存。
+
+#### 版本解析
+
+```go
+// 短版本号 → 完整版本号（参见第 4 节的版本选择链路）
+resolvedFCVersion := featureflags.ResolveFirecrackerVersion(ctx, s.featureFlags, req.GetSandbox().GetFirecrackerVersion())
+```
+
+然后调用 `Factory.ResumeSandbox()` 进入真正的 VM 创建流程。
+
+> **为什么叫 Resume 而不是 Create？** 因为 E2B 中所有沙箱都是从模板快照恢复的——即使是"新建"沙箱，也是从基础模板的快照恢复。真正的冷启动（`CreateSandbox`）只在模板构建阶段使用。
+
+### 9.4 资源初始化（并行阶段）
+
+`Factory.ResumeSandbox()` 是沙箱创建最核心的函数。它首先**并行**初始化四类资源：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+
+// 四个 Promise 并行执行：
+uffdPromise    := utils.NewPromise(func() { ... })  // UFFD 内存服务
+ipsPromise     := getNetworkSlot(ctx, ...)           // 网络 Slot
+overlayPromise := utils.NewPromise(func() { ... })   // Rootfs Overlay
+memoryPromise  := utils.NewPromise(func() { ... })   // 内存预取
+
+// 等待所有资源就绪
+ips, err     := ipsPromise.Wait(ctx)
+overlay, err := overlayPromise.Wait(ctx)
+_, err       := memoryPromise.Wait(ctx)
+```
+
+并行初始化是性能关键——网络创建、磁盘挂载、内存服务互不依赖，同时进行可以显著缩短启动时间。
+
+#### 资源 A：网络 Slot
+
+从预创建的网络池中获取一个 Slot（详见第 12 节）。每个 Slot 包含：
+- 一个 Linux 网络命名空间
+- 一对 veth 设备（沙箱侧 + 宿主侧）
+- 一个 TAP 设备（Firecracker 用）
+- 一组 IP 地址
+- 配置好的 iptables NAT 和 nftables 防火墙规则
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+func getNetworkSlot(ctx, networkPool, cleanup, networkConfig) *utils.Promise[*network.Slot] {
+    return utils.NewPromise(func() (*network.Slot, error) {
+        slot, err := networkPool.Get(ctx, networkConfig)
+        // ...
+        cleanup.Add(ctx, func(ctx context.Context) error {
+            go networkPool.Return(ctx, slot)  // 沙箱销毁时归还到池中
+            return nil
+        })
+        return slot, nil
+    })
+}
+```
+
+池化设计意味着：创建沙箱时不需要创建网络命名空间（耗时操作），直接从池中取一个已经配置好的即可。
+
+#### 资源 B：Rootfs Overlay（NBD + CoW）
+
+创建 Copy-on-Write 文件系统叠加层，让每个沙箱共享只读模板，独立写入层（详见第 10 节）：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go → overlayPromise
+readonlyRootfs, _ := t.Rootfs()                  // 只读模板
+overlay, _ := rootfs.NewNBDProvider(              // 创建 NBD 叠加层
+    ctx,
+    readonlyRootfs,
+    sandboxFiles.SandboxCacheRootfsPath(...),     // 写入层路径
+    f.devicePool,                                 // NBD 设备池
+    f.featureFlags,
+)
+cleanup.Add(ctx, overlay.Close)
+go overlay.Start(execCtx)                         // 后台运行 NBD 服务
+```
+
+NBD overlay 的启动过程（`NewNBDProvider`）：
+1. 从模板读取 rootfs 的大小和块大小
+2. 创建一个 mmap 稀疏文件作为写入层缓存
+3. 创建 `block.Overlay`：读请求先查缓存再回退到模板，写请求只进缓存
+4. 从 `DevicePool` 获取一个空闲的 `/dev/nbdX` 设备
+5. 通过 Unix socketpair + Netlink 将 overlay 连接到 NBD 设备
+
+#### 资源 C：UFFD 内存服务
+
+UFFD（Userfaultfd）是 Linux 内核提供的用户态缺页处理机制。E2B 用它实现**内存的按需加载**——VM 恢复时不需要把整个内存快照加载到内存，而是在 VM 访问到某个页面时才从快照文件读取：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go → uffdPromise
+memfile, _ := t.Memfile(ctx)                      // 内存快照文件
+fcUffd := uffd.New(memfile, fcUffdPath)            // 创建 UFFD handler
+
+// → memoryPromise
+fcUffd.Start(ctx, sandboxID)                       // 启动 UFFD 服务
+// 监听 Firecracker 创建的 UFFD socket
+// 当 VM 访问到未加载的内存页时，从 memfile 读取并注入
+```
+
+**内存预取**：如果模板包含预取元数据（之前通过 Checkpoint 采集的缺页顺序），会启动后台预取器提前加载热点内存页：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+if meta.Prefetch != nil && meta.Prefetch.Memory != nil {
+    go func() {
+        p := prefetch.New(l, memfile, fcUffd, meta.Prefetch.Memory, f.featureFlags)
+        p.Start(execCtx)  // 按之前记录的顺序预加载内存页
+    }()
+}
+```
+
+#### 资源 D：Cgroup
+
+创建 Linux cgroup 用于资源记账（CPU/内存用量统计）：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+cgroupHandle, cgroupFD := createCgroup(ctx, f.cgroupManager, sandboxFiles.SandboxCgroupName())
+// cgroupFD 会传给 Firecracker 进程，通过 CLONE_INTO_CGROUP 原子地将进程放入 cgroup
+```
+
+### 9.5 启动 Firecracker 进程
+
+所有资源就绪后，创建 Firecracker 进程：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+fcHandle, _ := fc.NewProcess(ctx, execCtx, f.config, ips, sandboxFiles, config.FirecrackerConfig, overlay, rootfsPaths)
+```
+
+`NewProcess` 验证 Firecracker 二进制和内核文件存在后，在 `Resume()` 中并行执行三件事：
 
 ```go
 // packages/orchestrator/pkg/sandbox/fc/process.go
-cmd := exec.CommandContext(execCtx,
-    "unshare", "-m", "--",          // 新的 mount namespace
-    "bash", "-c", startScript.Value, // 包含 ip netns exec 和 firecracker 命令
-)
-cmd.SysProcAttr = &syscall.SysProcAttr{
-    Setsid:      true,
-    UseCgroupFD: true,
-    CgroupFD:    cgroupFD,  // 原子放入 cgroup
+func (p *Process) Resume(ctx, sbxMetadata, uffdSocketPath, snapfile, uffdReady, accessToken, cgroupFD, txRateLimit) error {
+    // 先把 rootfs 链接指向 /dev/null（FC 启动时 rootfs 可能还没准备好）
+    utils.SymlinkForce("/dev/null", rootfsLinkPath)
+
+    eg, egCtx := errgroup.WithContext(ctx)
+
+    // 并行 1：启动 FC 进程并等待 API socket 就绪
+    eg.Go(func() error {
+        return p.configure(egCtx, sbxMetadata, nil, nil, cgroupFD)
+        // 内部：unshare -m → ip netns exec → firecracker --api-sock ...
+    })
+
+    // 并行 2：等待 UFFD socket 就绪
+    eg.Go(func() error {
+        return socket.Wait(egCtx, uffdSocketPath)
+    })
+
+    // 并行 3：rootfs 就绪后更新符号链接
+    eg.Go(func() error {
+        rootfsPath, _ := p.rootfsProvider.Path()  // 等待 NBD 设备就绪
+        return utils.SymlinkForce(rootfsPath, rootfsLinkPath)
+    })
+
+    eg.Wait()  // 三者都完成后继续
+    // ...
 }
-cmd.Start()
 ```
 
-生成的启动脚本大致如下：
+启动脚本大致如下（由 `script_builder.go` 生成）：
 
 ```bash
 mount --make-rprivate / &&
@@ -906,38 +1244,218 @@ mount -t tmpfs tmpfs /fc-vm -o X-mount.mkdir &&
 ln -s /path/to/rootfs.ext4 /fc-vm/rootfs.ext4 &&
 mkdir -p /fc-vm/kernel &&
 ln -s /fc-kernels/vmlinux-6.1.158/vmlinux.bin /fc-vm/kernel/vmlinux &&
-ip netns exec ns-1 /fc-versions/v1.12.1/firecracker --api-sock /tmp/fc.sock
+ip netns exec ns-{idx} /fc-versions/v1.12.1_210cbac/firecracker --api-sock /tmp/fc.sock
 ```
 
-**Step 4: 通过 Firecracker HTTP API 配置 VM**
+关键点：
+- `unshare -m`：创建独立的 mount namespace，防止沙箱间文件系统互相干扰
+- `ip netns exec ns-{idx}`：在之前创建的网络命名空间中运行 Firecracker
+- 进程通过 `SysProcAttr.CgroupFD` 在创建时原子地放入 cgroup
 
-Firecracker 启动后监听 Unix socket，Orchestrator 通过 HTTP API 配置：
+#### 加载快照并恢复 VM
+
+三个并行任务完成后，通过 Firecracker HTTP API 执行快照恢复：
 
 ```go
-// packages/orchestrator/pkg/sandbox/fc/client.go
-p.client.setBootSource(ctx, kernelPath, kernelArgs)       // PUT /boot-source
-p.client.setRootfsDrive(ctx, rootfsPath)                   // PUT /drives/rootfs
-p.client.setNetworkInterface(ctx, tapDevice, rateLimiter)  // PUT /network-interfaces/eth0
-p.client.setMachineConfig(ctx, vcpu, memMB, hugePages)     // PUT /machine-config
-p.client.setEntropyDevice(ctx)                             // PUT /entropy
-p.client.startVM(ctx)                                      // PUT /actions {type: InstanceStart}
+// packages/orchestrator/pkg/sandbox/fc/process.go — Resume() 后续部分
+
+// 1. 配置 metrics
+p.client.setMetrics(ctx, p.metricsPath)                          // PUT /metrics
+
+// 2. 加载快照（核心操作）
+p.client.loadSnapshot(ctx, uffdSocketPath, uffdReady, snapfile)  // PUT /snapshot/load
+// 这一步告诉 Firecracker：
+//   - 从 snapfile 恢复 VM 的 CPU/设备状态
+//   - 内存通过 UFFD socket 按需加载（不是一次性加载整个 memfile）
+
+// 3. 配置网络速率限制
+p.client.setTxRateLimit(ctx, vpeerName, txRateLimit)             // PATCH /network-interfaces
+
+// 4. 恢复 VM 运行
+p.client.resumeVM(ctx)                                           // PATCH /vm {state: "Resumed"}
+
+// 5. 设置 MMDS 元数据（沙箱内的 Envd 通过 169.254.169.254 读取）
+p.client.setMmds(ctx, MmdsMetadata{
+    SandboxID:            sbxMetadata.SandboxID,
+    TemplateID:           sbxMetadata.TemplateID,
+    LogsCollectorAddress: "http://{orchIP}/logs",
+    AccessTokenHash:      keys.HashAccessToken(accessToken),
+})                                                               // PUT /mmds
 ```
 
-**Step 5: 等待 Envd 就绪**
+**`loadSnapshot` 与 UFFD 的协作**：Firecracker 加载快照时不会读取整个内存文件。它注册一个 UFFD 区域，当 VM 访问到未加载的内存页时，内核产生缺页异常，UFFD handler 从 memfile 中读取对应页面并注入——这就是为什么沙箱可以亚秒级恢复，即使内存快照有几 GB。
+
+### 9.6 等待 Envd 就绪
+
+VM 恢复运行后，Orchestrator 轮询 VM 内的 Envd 守护进程，确认它已准备好接收用户命令：
 
 ```go
-// VM 启动后，轮询 envd 的 /init 端点
-// 超时由 ENVD_TIMEOUT 配置（默认 10s）
+// packages/orchestrator/pkg/sandbox/envd.go
+func (s *Sandbox) initEnvd(ctx context.Context) error {
+    address := fmt.Sprintf("http://%s:%d/init", s.Slot.HostIPString(), consts.DefaultEnvdServerPort)
+    // DefaultEnvdServerPort = 49983
+
+    response, count, err := s.doRequestWithInfiniteRetries(ctx, http.MethodPost, address)
+    // ...
+}
 ```
 
-**Step 6: 注册到 Redis**
+`doRequestWithInfiniteRetries` 的行为：
+- **无限重试**，每次间隔 5ms，直到成功或超时
+- 每次请求带上初始化数据（环境变量、工作目录、卷挂载等）
+- 安全模式下附带 `X-Access-Token` 请求头
+- 预期响应：`204 No Content`
 
 ```go
-// packages/shared/pkg/sandbox-catalog/catalog_redis.go
-// Key: sandbox:catalog:{sandboxId}
-// Value: { orchestrator_ip, execution_id, started_at, max_length_hours }
-catalog.StoreSandbox(ctx, sandboxID, info, expiration)
+// packages/orchestrator/pkg/sandbox/envd.go
+jsonBody := &envd.PostInitJSONBody{
+    EnvVars:        s.Config.Envd.Vars,           // 用户设置的环境变量
+    HyperloopIP:    s.config.NetworkConfig.OrchestratorInSandboxIPAddress,
+    AccessToken:    utils.DerefOrDefault(s.Config.Envd.AccessToken, ""),
+    DefaultUser:    utils.DerefOrDefault(s.Config.Envd.DefaultUser, ""),
+    DefaultWorkdir: utils.DerefOrDefault(s.Config.Envd.DefaultWorkdir, ""),
+    VolumeMounts:   s.convertMounts(s.Config.VolumeMounts),
+}
 ```
+
+同时有一个监控 goroutine 检测异常退出：
+
+```go
+go func() {
+    select {
+    case <-time.After(timeout):
+        cancel(fmt.Errorf("syncing took too long"))
+    case <-s.process.Exit.Done():
+        cancel(fmt.Errorf("fc process exited prematurely: %w", err))
+    }
+}()
+```
+
+Envd 响应 204 后，`startedAt` 被更新为当前时间——**沙箱的超时计时从 Envd 就绪的那一刻开始**，而不是从请求到达的那一刻。这补偿了启动过程本身消耗的时间。
+
+### 9.7 注册与返回
+
+#### Orchestrator 侧
+
+Envd 就绪后，Orchestrator 完成最后的收尾：
+
+```go
+// packages/orchestrator/pkg/sandbox/sandbox.go
+
+// 标记为 Running 状态（此前是 Starting）
+f.Sandboxes.MarkRunning(ctx, sbx)
+
+// 启动健康检查（周期性 ping Envd）
+go sbx.Checks.Start(execCtx)
+
+// 启动退出监控 goroutine
+go func() {
+    select {
+    case <-fcUffd.Exit().Done():   // UFFD 进程退出
+    case <-fcHandle.Exit.Done():   // Firecracker 进程退出
+    }
+    sbx.Stop(ctx)  // 任一退出都触发清理
+}()
+```
+
+然后通过 gRPC 返回成功给 API。
+
+#### API 侧
+
+API 收到 gRPC 响应后：
+
+```go
+// packages/api/internal/orchestrator/create_instance.go
+
+// 1. 重新校准时间（补偿创建耗时）
+startTime = time.Now()
+endTime = startTime.Add(timeout)
+
+// 2. 构建沙箱模型
+sbx = sandbox.NewSandbox(sandboxID, templateID, ..., startTime, endTime, ...)
+
+// 3. 写入沙箱存储 + Redis 路由表
+err = o.sandboxStore.Add(ctx, sbx, true)
+// 内部触发 addSandboxToRoutingTable()
+```
+
+**Redis 路由表**是 Client-Proxy 找到沙箱的关键：
+
+```go
+// 写入 Redis:
+// Key:   sandbox:catalog:{sandboxID}
+// Value: { orchestrator_id, orchestrator_ip, execution_id, started_at, max_length_hours }
+// TTL:   团队的 MaxLengthInHours
+```
+
+当用户后续向沙箱发请求时，Client-Proxy 查询这个 Redis key 就能找到沙箱在哪个 Orchestrator 上运行。
+
+最后，API 向用户返回 `201 Created`，携带沙箱 ID 和连接信息。
+
+### 9.8 生命周期管理
+
+沙箱创建完成后，其生命周期由多个机制共同管理。
+
+#### 超时自动清理
+
+API 侧有一个 `Evictor`，以 50ms 间隔轮询过期沙箱：
+
+```go
+// packages/api/internal/orchestrator/evictor/evict.go
+// 每 50ms 检查一次
+expired := store.ExpiredItems(ctx)
+for _, sbx := range expired {
+    if sbx.AutoPause {
+        // 暂停而非销毁
+        orchestrator.RemoveSandbox(ctx, teamID, sandboxID, StateActionPause)
+    } else {
+        // 直接销毁
+        orchestrator.RemoveSandbox(ctx, teamID, sandboxID, StateActionKill)
+    }
+}
+```
+
+#### 清理栈
+
+Orchestrator 侧，每个沙箱启动时注册了一个生命周期 goroutine：
+
+```go
+// packages/orchestrator/pkg/server/sandboxes.go
+func (s *Server) setupSandboxLifecycle(ctx context.Context, sbx *sandbox.Sandbox) {
+    go func() {
+        sbx.Wait(ctx)   // 阻塞直到沙箱退出
+        sbx.Close(ctx)  // 按注册的逆序执行清理栈
+        s.proxy.RemoveFromPool(sbx.LifecycleID)
+    }()
+}
+```
+
+`Close()` 执行的清理栈（按逆序）：
+
+```
+1. sbx.Stop()                    ← 停止健康检查 → SIGTERM FC → 等待退出 → UFFD 停止
+2. hostStatsCollector.Stop()     ← 最后一次采集 cgroup 资源指标
+3. cgroupHandle.Remove()         ← 删除 /sys/fs/cgroup/e2b/{sandbox} 目录
+4. Sandboxes.MarkStopping()      ← 从活跃 map 中移除（不再接受新请求）
+5. Sandboxes.Remove()            ← 彻底从 map 删除
+6. rootfsProvider.Close()        ← 断开 NBD 连接，归还 /dev/nbdX 到设备池
+7. networkPool.Return(slot)      ← 归还网络 Slot 到回收池
+8. cleanupFiles()                ← 删除沙箱临时文件
+```
+
+#### 暂停与恢复
+
+暂停流程（Pause）：
+1. 停止健康检查
+2. `PATCH /vm {state: "Paused"}` 暂停 Firecracker VM
+3. `PUT /snapshot/create` 生成 snapfile（仅 VM 状态，不含内存）
+4. 通过自定义 FC 接口导出脏内存页和 rootfs diff
+5. 写入 metadata.json
+6. 加入本地模板缓存
+7. 异步上传到持久存储（GCS/本地）
+8. 销毁旧 VM
+
+恢复流程（Resume）走的就是上面描述的 `ResumeSandbox()`，加载的是暂停时生成的快照而非基础模板快照。API 会优先将恢复请求调度到之前暂停的那个节点（节点亲和），因为该节点缓存了快照数据。
 
 ---
 
