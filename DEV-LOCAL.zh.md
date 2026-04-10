@@ -44,6 +44,105 @@
 - E2B API: http://localhost:3000
 - E2B 客户端代理: http://localhost:3002
 - E2B Orchestrator: http://localhost:5008
+- MinIO API: http://localhost:19000
+- MinIO Console: http://localhost:19001
+
+# MinIO 对象存储配置
+
+## 启动 MinIO
+
+```bash
+./minio server --address :19000 --console-address :19001 /root/ya/e2b/minio_data
+```
+
+启动后默认 root 凭据为 `minioadmin` / `minioadmin`（可通过 `MINIO_ROOT_USER` 和 `MINIO_ROOT_PASSWORD` 环境变量自定义）。
+
+## 配置 mc 命令行工具
+
+```bash
+# 添加本地 MinIO 别名
+./mc alias set local http://localhost:19000 minioadmin minioadmin
+
+# 验证连接
+./mc admin info local
+```
+
+## 创建 Bucket
+
+```bash
+# 查看已有 bucket
+./mc ls local/
+
+# 创建新 bucket（如需要）
+./mc mb local/e2b
+```
+
+## 创建 Service Account（S3 SDK 用）
+
+```bash
+./mc admin user svcacct add local minioadmin --json
+```
+
+输出示例：
+
+```json
+{
+  "accessKey": "97DERZQR0JHGJG31DVHA",
+  "secretKey": "94tKyWjSGy5yOe+R1QQ+tr1+A0VgHWrMbJrwI9vL"
+}
+```
+
+## S3 SDK 连接配置
+
+| 参数 | 值 |
+|---|---|
+| Endpoint | `http://localhost:19000` |
+| Region | `us-east-1` |
+| Force Path Style | `true`（MinIO 必须） |
+| Access Key | 上一步生成的 accessKey |
+| Secret Key | 上一步生成的 secretKey |
+| Bucket | `e2b` |
+
+### Python (boto3)
+
+```python
+import boto3
+
+s3 = boto3.client('s3',
+    endpoint_url='http://localhost:19000',
+    aws_access_key_id='<ACCESS_KEY>',
+    aws_secret_access_key='<SECRET_KEY>',
+    region_name='us-east-1',
+)
+
+# 上传文件
+s3.upload_file('local_file.txt', 'e2b', 'remote_key.txt')
+```
+
+### Node.js (AWS SDK v3)
+
+```javascript
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+
+const s3 = new S3Client({
+  endpoint: 'http://localhost:19000',
+  region: 'us-east-1',
+  credentials: {
+    accessKeyId: '<ACCESS_KEY>',
+    secretAccessKey: '<SECRET_KEY>',
+  },
+  forcePathStyle: true,
+});
+```
+
+### Go (MinIO SDK)
+
+```go
+client, _ := minio.New("localhost:19000", &minio.Options{
+    Creds:  credentials.NewStaticV4("<ACCESS_KEY>", "<SECRET_KEY>", ""),
+    Secure: false,
+})
+```
 
 # 客户端配置
 ```dotenv
